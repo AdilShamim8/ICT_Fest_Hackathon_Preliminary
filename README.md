@@ -5,7 +5,7 @@ multiple tenant organizations. Each organization has its own rooms, staff
 (admins), and members. Members book rooms for time slots; admins manage rooms and
 pull reports.
 
-## Stack
+##  Stack
 
 - Python 3.11, FastAPI, SQLAlchemy, SQLite (single file, no external DB service)
 - JWT auth (access + refresh tokens), HS256, secret from the `JWT_SECRET` env var
