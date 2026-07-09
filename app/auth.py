@@ -19,9 +19,13 @@ from .database import get_db
 from .errors import AppError
 from .models import User
 
-# Access tokens presented to /auth/logout are recorded here so they can no
-# longer be used.
+# Access tokens presented to /auth/logout are recorded here (by jti) so they
+# can no longer be used.
 _revoked_tokens: set[str] = set()
+
+# Refresh tokens that have already been used are recorded here (by jti) so a
+# refresh token can only be redeemed once (rule 8: single-use).
+_revoked_refresh_tokens: set[str] = set()
 
 _PBKDF2_ROUNDS = 100_000
 
@@ -47,7 +51,9 @@ def _now_ts() -> int:
 
 def create_access_token(user: User) -> str:
     iat = _now_ts()
-    lifetime = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES * 60)
+    # BUGFIX (rule 8): access token must expire in exactly 900s. The value is
+    # already in minutes; multiplying by 60 produced a 15-hour lifetime.
+    lifetime = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     payload = {
         "sub": str(user.id),
         "org": user.org_id,
@@ -94,7 +100,9 @@ def get_token_payload(request: Request) -> dict:
     payload = decode_token(token)
     if payload.get("type") != "access":
         raise AppError(401, "UNAUTHORIZED", "Wrong token type")
-    if payload.get("sub") in _revoked_tokens:
+    # BUGFIX (rule 8): logout revokes tokens by jti, so the blacklist check must
+    # look up jti — not sub (the user id), which never matched.
+    if payload.get("jti") in _revoked_tokens:
         raise AppError(401, "UNAUTHORIZED", "Token has been revoked")
     return payload
 

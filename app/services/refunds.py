@@ -12,9 +12,11 @@ from ..models import Booking, RefundLog
 
 
 def log_refund(db: Session, booking: Booking, percent: int) -> RefundLog:
-    dollars = booking.price_cents / 100.0
-    refund_dollars = dollars * (percent / 100.0)
-    amount_cents = int(refund_dollars * 100)
+    # BUGFIX (rule 6): round half-cents UP with integer math. The previous
+    # float truncation (int(refund_dollars * 100)) rounded down and could also
+    # disagree with the amount returned to the caller. This formula is identical
+    # to the one used in the cancel response, so the two amounts always match.
+    amount_cents = (booking.price_cents * percent + 50) // 100
     entry = RefundLog(
         booking_id=booking.id,
         amount_cents=amount_cents,

@@ -29,7 +29,11 @@ def notify_created(booking) -> None:
 
 
 def notify_cancelled(booking) -> None:
-    with _audit_lock:
-        _write_audit("cancelled", booking)
-        with _email_lock:
-            _send_email("cancelled", booking)
+    # BUGFIX (rule 16 / liveness): acquire the locks in the SAME order as
+    # notify_created (email first, then audit). Previously this function locked
+    # audit -> email, so a concurrent create + cancel deadlocked (lock-order
+    # inversion), wedging the thread pool and hanging the whole service.
+    with _email_lock:
+        _send_email("cancelled", booking)
+        with _audit_lock:
+            _write_audit("cancelled", booking)

@@ -1,4 +1,5 @@
 """Booking creation, listing, detail and cancellation."""
+import threading
 import time
 from datetime import datetime, timedelta
 
@@ -22,6 +23,13 @@ MIN_DURATION_HOURS = 1
 MAX_DURATION_HOURS = 8
 QUOTA_LIMIT = 3
 QUOTA_WINDOW_HOURS = 24
+
+# BUGFIX (rules 3, 4, 6, 7, 16): SQLite has no row-level locking, so the
+# check-then-write critical sections for booking creation and cancellation are
+# serialized with a single process-wide lock. Both paths acquire only this lock
+# (and, nested within create, the reference-code lock — always in that order),
+# so there is no lock-order inversion.
+_booking_lock = threading.Lock()
 
 
 def _pricing_warmup() -> None:
@@ -47,7 +55,9 @@ def _has_conflict(db: Session, room_id: int, start: datetime, end: datetime) -> 
     )
     _pricing_warmup()
     for b in existing:
-        if b.start_time <= end and start <= b.end_time:
+        # BUGFIX (rule 3): overlap uses strict inequality so back-to-back
+        # bookings (one ending exactly when another starts) do NOT conflict.
+        if b.start_time < end and start < b.end_time:
             return True
     return False
 
@@ -79,46 +89,59 @@ def create_booking(
 ):
     ratelimit.record_and_check(user.id)
 
-    start = parse_input_datetime(payload.start_time)
-    end = parse_input_datetime(payload.end_time)
+    # BUGFIX (error handling): a malformed datetime string must yield
+    # 400 INVALID_BOOKING_WINDOW, not an unhandled 500.
+    try:
+        start = parse_input_datetime(payload.start_time)
+        end = parse_input_datetime(payload.end_time)
+    except (ValueError, TypeError):
+        raise AppError(400, "INVALID_BOOKING_WINDOW", "Invalid datetime format")
     now = datetime.utcnow()
 
-    if start <= now - timedelta(seconds=300):
+    # BUGFIX (rule 2): start_time must be strictly in the future — no grace.
+    if start <= now:
         raise AppError(400, "INVALID_BOOKING_WINDOW", "start_time must be in the future")
 
     duration_hours = (end - start).total_seconds() / 3600
     if duration_hours != int(duration_hours):
         raise AppError(400, "INVALID_BOOKING_WINDOW", "duration must be a whole number of hours")
     duration_hours = int(duration_hours)
-    if duration_hours > MAX_DURATION_HOURS:
+    # BUGFIX (rule 2): enforce the minimum duration too. This also rejects
+    # end_time <= start_time (which yields a duration <= 0).
+    if duration_hours < MIN_DURATION_HOURS or duration_hours > MAX_DURATION_HOURS:
         raise AppError(400, "INVALID_BOOKING_WINDOW", "duration out of range")
 
     room = db.query(Room).filter(Room.id == payload.room_id, Room.org_id == user.org_id).first()
     if room is None:
         raise AppError(404, "ROOM_NOT_FOUND", "Room not found")
 
-    if _has_conflict(db, room.id, start, end):
-        raise AppError(409, "ROOM_CONFLICT", "Room already booked for this interval")
+    # BUGFIX (rules 3, 4, 7): make conflict/quota checks and the insert atomic.
+    with _booking_lock:
+        if _has_conflict(db, room.id, start, end):
+            raise AppError(409, "ROOM_CONFLICT", "Room already booked for this interval")
 
-    _check_quota(db, user.id, now, start)
+        _check_quota(db, user.id, now, start)
 
-    price_cents = room.hourly_rate_cents * duration_hours
-    booking = Booking(
-        room_id=room.id,
-        user_id=user.id,
-        start_time=start,
-        end_time=end,
-        status="confirmed",
-        reference_code=reference.next_reference_code(),
-        price_cents=price_cents,
-        created_at=now,
-    )
-    db.add(booking)
-    db.commit()
-    db.refresh(booking)
+        price_cents = room.hourly_rate_cents * duration_hours
+        booking = Booking(
+            room_id=room.id,
+            user_id=user.id,
+            start_time=start,
+            end_time=end,
+            status="confirmed",
+            reference_code=reference.next_reference_code(),
+            price_cents=price_cents,
+            created_at=now,
+        )
+        db.add(booking)
+        db.commit()
+        db.refresh(booking)
 
     stats.record_create(room.id, price_cents)
+    # BUGFIX (rules 12, 13): a new booking changes both availability and the
+    # usage report, so invalidate both cached views.
     cache.invalidate_availability(room.id, start.date().isoformat())
+    cache.invalidate_report(user.org_id)
     notifications.notify_created(booking)
 
     return serialize_booking(booking)
@@ -133,10 +156,12 @@ def list_bookings(
 ):
     base = db.query(Booking).filter(Booking.user_id == user.id)
     total = base.count()
+    # BUGFIX (rule 11): sort ascending by start_time, offset by (page-1)*limit,
+    # and honour the caller's limit instead of a hardcoded 10.
     items = (
-        base.order_by(Booking.start_time.desc(), Booking.id.asc())
-        .offset(page * limit)
-        .limit(10)
+        base.order_by(Booking.start_time.asc(), Booking.id.asc())
+        .offset((page - 1) * limit)
+        .limit(limit)
         .all()
     )
     return {
@@ -161,9 +186,13 @@ def get_booking(
     )
     if booking is None:
         raise AppError(404, "BOOKING_NOT_FOUND", "Booking not found")
+    # BUGFIX (rule 10): members may only read their own bookings; another
+    # member's id must behave as non-existent.
+    if user.role != "admin" and booking.user_id != user.id:
+        raise AppError(404, "BOOKING_NOT_FOUND", "Booking not found")
 
     response = serialize_booking(booking)
-    response["start_time"] = iso_utc(booking.created_at)
+    # BUGFIX (serialization): do NOT overwrite start_time with created_at.
     response["refunds"] = [
         {
             "amount_cents": r.amount_cents,
@@ -192,29 +221,40 @@ def cancel_booking(
     if user.role != "admin" and booking.user_id != user.id:
         raise AppError(404, "BOOKING_NOT_FOUND", "Booking not found")
 
-    if booking.status == "cancelled":
-        raise AppError(409, "ALREADY_CANCELLED", "Booking already cancelled")
+    # BUGFIX (rule 6): serialize the status-check -> refund -> commit so two
+    # concurrent cancels of the same booking produce exactly one RefundLog and
+    # the loser gets 409. db.refresh re-reads committed state inside the lock.
+    with _booking_lock:
+        db.refresh(booking)
+        if booking.status == "cancelled":
+            raise AppError(409, "ALREADY_CANCELLED", "Booking already cancelled")
 
-    now = datetime.utcnow()
-    notice = booking.start_time - now
-    notice_hours = int(notice.total_seconds() // 3600)
-    if notice_hours > 48:
-        refund_percent = 100
-    elif notice >= timedelta(hours=24):
-        refund_percent = 50
-    else:
-        refund_percent = 50
+        now = datetime.utcnow()
+        notice = booking.start_time - now
+        # BUGFIX (rule 6): correct tier boundaries — >=48h => 100%, >=24h => 50%,
+        # otherwise 0% (the else branch previously returned 50).
+        if notice >= timedelta(hours=48):
+            refund_percent = 100
+        elif notice >= timedelta(hours=24):
+            refund_percent = 50
+        else:
+            refund_percent = 0
 
-    refund_amount_cents = round(booking.price_cents * (refund_percent / 100.0))
+        # BUGFIX (rule 6): round half-cents UP using integer math, and use the
+        # SAME formula the RefundLog uses so the two amounts always match.
+        refund_amount_cents = (booking.price_cents * refund_percent + 50) // 100
 
-    log_refund(db, booking, refund_percent)
+        log_refund(db, booking, refund_percent)
 
-    _settlement_pause()
-    booking.status = "cancelled"
-    db.commit()
+        _settlement_pause()
+        booking.status = "cancelled"
+        db.commit()
 
     stats.record_cancel(booking.room_id, booking.price_cents)
+    # BUGFIX (rules 12, 13): a cancellation changes both the usage report and
+    # availability, so invalidate both cached views.
     cache.invalidate_report(user.org_id)
+    cache.invalidate_availability(booking.room_id, booking.start_time.date().isoformat())
     notifications.notify_cancelled(booking)
 
     return {

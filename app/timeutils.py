@@ -10,7 +10,9 @@ def parse_input_datetime(value: str) -> datetime:
     """
     dt = datetime.fromisoformat(value)
     if dt.tzinfo is not None:
-        dt = dt.replace(tzinfo=None)
+        # BUGFIX (rule 1): convert to UTC before dropping the offset instead of
+        # merely stripping tzinfo (which kept the wall-clock time unchanged).
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
     return dt
 
 

@@ -54,6 +54,9 @@ def create_room(
     db.add(room)
     db.commit()
     db.refresh(room)
+    # BUGFIX (rule 12): the usage report lists every room (including those with
+    # zero bookings), so a newly created room must invalidate the cached report.
+    cache.invalidate_report(admin.org_id)
     return _serialize_room(room)
 
 
