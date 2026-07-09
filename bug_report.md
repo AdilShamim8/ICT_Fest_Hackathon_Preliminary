@@ -7,7 +7,7 @@ behavior against the business rules, and the minimal fix applied. Every fix was
 verified empirically by driving the running API (spec probe, concurrency/deadlock
 probes, and the provided smoke test — all green).
 
-**Summary:** 25 bugs fixed — **4 Easy, 15 Medium, 6 Hard**. Line numbers refer to
+**Summary:** 26 bugs fixed — **4 Easy, 16 Medium, 6 Hard**. Line numbers refer to
 the original (broken) files. All fixes preserve the API contract exactly.
 
 | # | Bug | File | Difficulty | Category |
@@ -37,6 +37,7 @@ the original (broken) files. All fixes preserve the API contract exactly.
 | 23 | Deadlock (lock-order inversion) hangs service | `app/services/notifications.py` | Hard | Concurrency |
 | 24 | Double-cancel race → duplicate RefundLogs | `app/routers/bookings.py` | Hard | Concurrency |
 | 25 | Registration race → 500 instead of 409 | `app/routers/auth.py` | Medium | Concurrency |
+| 26 | Refresh single-use race (check-then-burn not atomic) | `app/routers/auth.py` | Medium | Concurrency |
 
 ---
 
@@ -75,18 +76,19 @@ if data.get("type") != "refresh":
     raise AppError(401, "UNAUTHORIZED", "Wrong token type")
 user = db.query(User).filter(User.id == int(data["sub"])).first()
 ...
-# After
+# After  (check-and-burn made atomic — see Bug 26 for the concurrency detail)
 data = decode_token(payload.refresh_token)
 if data.get("type") != "refresh":
     raise AppError(401, "UNAUTHORIZED", "Wrong token type")
-if data.get("jti") in _revoked_refresh_tokens:      # reuse → 401
-    raise AppError(401, "UNAUTHORIZED", "Refresh token has already been used")
+with _refresh_lock:
+    if data.get("jti") in _revoked_refresh_tokens:  # reuse → 401
+        raise AppError(401, "UNAUTHORIZED", "Refresh token has already been used")
+    _revoked_refresh_tokens.add(data["jti"])        # mark spent, atomically
 user = db.query(User).filter(User.id == int(data["sub"])).first()
 if user is None:
     raise AppError(401, "UNAUTHORIZED", "Unknown user")
-_revoked_refresh_tokens.add(data["jti"])            # mark this refresh token spent
 ```
-(`_revoked_refresh_tokens: set[str] = set()` added in `app/auth.py`.)
+(`_revoked_refresh_tokens: set[str] = set()` added in `app/auth.py`; `_refresh_lock` in `app/routers/auth.py`.)
 
 ## Datetime & Error Handling
 
@@ -350,6 +352,27 @@ def notify_cancelled(booking):
 **Symptom:** Concurrent identical registrations return 500; concurrent same-new-org registrations return 500.
 **Fix:** wrap both the org insert and the user insert commits in `try/except IntegrityError`. The user-insert loser rolls back and raises 409 USERNAME_TAKEN; the org-insert loser rolls back, re-reads the winning org, and joins it as a member.
 
+### Bug 26 — Refresh single-use race (check-then-burn not atomic)
+**File:** `app/routers/auth.py`, `refresh` · **Difficulty:** Medium · **Category:** Concurrency (rule 8)
+**Root cause:** The single-use enforcement is a check-then-act on shared state: `if jti in _revoked_refresh_tokens ... ; _revoked_refresh_tokens.add(jti)`, with a DB user-lookup sitting between the check and the add. Unlike every other race fix, this path had no lock, so concurrent refreshes of the same token can all pass the membership test before any records the jti — and several succeed.
+**Symptom:** Firing N concurrent `POST /auth/refresh` with the same refresh token yields more than one 200 (reproduced: 3 of 40 trials × 8 concurrent leaked 2–3 successes; rule 8 requires exactly one, rest → 401).
+```python
+# Before (single-use check, but not atomic)
+if data.get("jti") in _revoked_refresh_tokens:
+    raise AppError(401, "UNAUTHORIZED", "Refresh token has already been used")
+user = db.query(User).filter(User.id == int(data["sub"])).first()
+...
+_revoked_refresh_tokens.add(data["jti"])
+# After (atomic check-and-burn under a module-level _refresh_lock)
+with _refresh_lock:
+    if data.get("jti") in _revoked_refresh_tokens:
+        raise AppError(401, "UNAUTHORIZED", "Refresh token has already been used")
+    _revoked_refresh_tokens.add(data["jti"])
+user = db.query(User).filter(User.id == int(data["sub"])).first()
+if user is None:
+    raise AppError(401, "UNAUTHORIZED", "Unknown user")
+```
+
 ---
 
 ## Deliberately unchanged (not bugs)
@@ -366,4 +389,5 @@ def notify_cancelled(booking):
 - **Concurrency:** double-booking → exactly one 201; reference codes unique; double-cancel → one 200 + 409, exactly one RefundLog; rate limit holds; stats consistent.
 - **Deadlock:** direct and API-level bursts complete with 0 hangs; the service stays responsive.
 - **Registration races:** concurrent duplicate user → 409 (no 500); concurrent same-new-org → all succeed (no 500).
+- **Refresh single-use race:** 40 trials × 8 concurrent refreshes of the same token → exactly one 200 per trial (0 leaks) after the lock.
 - **Provided smoke test** (`tests/test_smoke.py`): passes.

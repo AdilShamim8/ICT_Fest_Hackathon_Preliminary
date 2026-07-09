@@ -1,4 +1,6 @@
 """Authentication endpoints: register, login, refresh, logout."""
+import threading
+
 from fastapi import APIRouter, Depends
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -19,6 +21,12 @@ from ..models import Organization, User
 from ..schemas import LoginRequest, RefreshRequest, RegisterRequest
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+# BUGFIX (rule 8, concurrency): the single-use refresh check is a check-then-act
+# on shared state (_revoked_refresh_tokens). Without a lock, concurrent refreshes
+# of the same token can all pass the membership test before any records the jti,
+# so several succeed instead of exactly one. This lock makes check+record atomic.
+_refresh_lock = threading.Lock()
 
 
 @router.post("/register", status_code=201)
@@ -102,14 +110,17 @@ def refresh(payload: RefreshRequest, db: Session = Depends(get_db)):
     data = decode_token(payload.refresh_token)
     if data.get("type") != "refresh":
         raise AppError(401, "UNAUTHORIZED", "Wrong token type")
-    # BUGFIX (rule 8): refresh tokens are single-use. Reject a token whose jti
-    # has already been redeemed, and record this jti before issuing new tokens.
-    if data.get("jti") in _revoked_refresh_tokens:
-        raise AppError(401, "UNAUTHORIZED", "Refresh token has already been used")
+    # BUGFIX (rule 8): refresh tokens are single-use. Atomically check-and-burn
+    # the jti under a lock so concurrent reuse of the same token yields exactly
+    # one success; the rest get 401. Burning before the user lookup is safe: an
+    # unknown user means the token is invalid anyway.
+    with _refresh_lock:
+        if data.get("jti") in _revoked_refresh_tokens:
+            raise AppError(401, "UNAUTHORIZED", "Refresh token has already been used")
+        _revoked_refresh_tokens.add(data["jti"])
     user = db.query(User).filter(User.id == int(data["sub"])).first()
     if user is None:
         raise AppError(401, "UNAUTHORIZED", "Unknown user")
-    _revoked_refresh_tokens.add(data["jti"])
     return {
         "access_token": create_access_token(user),
         "refresh_token": create_refresh_token(user),
